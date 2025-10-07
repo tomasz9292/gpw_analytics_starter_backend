@@ -1,6 +1,6 @@
 fastapi
 uvicorn[standard]
 pandas
-clickhouse-connect
+clickhouse-connect>=0.7.15
 python-multipart
 duckdb

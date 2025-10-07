@@ -68,25 +68,58 @@ def ensure_storage():
 
 def parse_mst(content: bytes) -> pd.DataFrame:
     """
-    Pliki .mst bywają w różnych formatach – próbujemy elastycznie.
-    Oczekujemy kolumn: date, open, high, low, close, volume (kolejność może być bez nagłówka).
+    Parser plików Stooq .mst (z mstall.zip).
+    Obsługuje nagłówek w formacie: <TICKER>,<PER>,<DATE>,<TIME>,<OPEN>,<HIGH>,<LOW>,<CLOSE>,<VOL>
+    oraz różne delimitery: ',', ';', tab.
+    Zwraca kolumny: date, open, high, low, close, volume
     """
-    try:
-        df = pd.read_csv(io.BytesIO(content))
-        if not set(["date","open","high","low","close","volume"]).issubset(df.columns):
-            raise ValueError("no header")
-    except Exception:
-        df = pd.read_csv(
-            io.BytesIO(content), header=None,
-            names=["date","open","high","low","close","volume"]
-        )
-    # daty
-    df["date"] = pd.to_datetime(df["date"]).dt.date
-    # sanity numeric
+    txt = content.decode("utf-8", errors="ignore").lstrip("\ufeff")
+    # wybierz delimiter
+    if ";" in txt.splitlines()[0]:
+        sep = ";"
+    elif "\t" in txt.splitlines()[0]:
+        sep = "\t"
+    else:
+        sep = ","
+
+    # Spróbuj z nagłówkiem Stooq
+    cols_stooq = ["<TICKER>", "<PER>", "<DATE>", "<TIME>", "<OPEN>", "<HIGH>", "<LOW>", "<CLOSE>", "<VOL>"]
+    first_line = txt.splitlines()[0].strip()
+
+    if all(c in first_line for c in ["<DATE>", "<OPEN>", "<CLOSE>"]):
+        df = pd.read_csv(io.StringIO(txt), sep=sep)
+        # odfiltruj ewentualne puste i wiersze nagłówka powtórzone w środku
+        df = df.loc[~df["<DATE>"].astype(str).str.startswith("<")]
+
+        # konwersje
+        df["date"] = pd.to_datetime(df["<DATE>"].astype(str), format="%Y%m%d", errors="coerce").dt.date
+        df["open"] = pd.to_numeric(df["<OPEN>"], errors="coerce")
+        df["high"] = pd.to_numeric(df["<HIGH>"], errors="coerce")
+        df["low"]  = pd.to_numeric(df["<LOW>"], errors="coerce")
+        df["close"]= pd.to_numeric(df["<CLOSE>"], errors="coerce")
+        df["volume"]=pd.to_numeric(df.get("<VOL>", 0), errors="coerce").fillna(0).astype("Int64")
+
+        df = df[["date","open","high","low","close","volume"]].dropna(subset=["date","close"])
+        return df.reset_index(drop=True)
+
+    # Fallback: brak nagłówka – 6 kolumn: date, open, high, low, close, volume
+    df = pd.read_csv(
+        io.StringIO(txt), sep=sep, header=None,
+        names=["date","open","high","low","close","volume"],
+        engine="python"
+    )
+    # niektóre pliki mogą mieć w pierwszym wierszu znaczniki w <> — odfiltruj
+    df = df.loc[~df["date"].astype(str).str.startswith("<")]
+
+    # data jako %Y%m%d
+    df["date"] = pd.to_datetime(df["date"].astype(str), format="%Y%m%d", errors="coerce").dt.date
     for c in ["open","high","low","close","volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["volume"] = df["volume"].fillna(0).astype("Int64")
+
     df = df.dropna(subset=["date","close"])
-    return df[["date","open","high","low","close","volume"]]
+    return df[["date","open","high","low","close","volume"]].reset_index(drop=True)
+
 
 @app.post("/ingest/stooq-zip")
 async def ingest_stooq_zip(file: UploadFile = File(...)):

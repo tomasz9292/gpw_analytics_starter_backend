@@ -3,3 +3,4 @@ uvicorn[standard]
 pandas
 clickhouse-connect
 python-multipart
+duckdb

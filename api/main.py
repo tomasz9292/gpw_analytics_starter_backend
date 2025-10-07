@@ -7,6 +7,7 @@ from datetime import date, datetime
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import clickhouse_connect
+from urllib.parse import urlparse
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -18,7 +19,11 @@ from pydantic import BaseModel
 TABLE_OHLC = os.getenv("TABLE_OHLC", "ohlc")
 
 # Wariant 1 – ClickHouse Cloud (jedno pole URL) np. https://abc123.us-east-1.aws.clickhouse.cloud:8443
-CLICKHOUSE_URL = os.getenv("CLICKHOUSE_URL")
+CLICKHOUSE_URL = os.getenv("CLICKHOUSE_URL", "")      # np. https://abc123.eu-west-1.aws.clickhouse.cloud:8443
+CLICKHOUSE_USER = os.getenv("CLICKHOUSE_USER", "default")
+CLICKHOUSE_PASSWORD = os.getenv("CLICKHOUSE_PASSWORD", "")
+CLICKHOUSE_DATABASE = os.getenv("CLICKHOUSE_DATABASE", "default")
+
 
 # Wariant 2 – Self-hosted
 CH_HOST = os.getenv("CH_HOST")
@@ -31,32 +36,30 @@ _CH_CLIENT = None
 
 
 def get_ch():
-    """
-    Zwraca klienta ClickHouse (Cloud lub self-hosted).
-    """
     global _CH_CLIENT
     if _CH_CLIENT is not None:
         return _CH_CLIENT
 
-    if CLICKHOUSE_URL:
-        # ClickHouse Cloud – łączymy się przez URL
-        _CH_CLIENT = clickhouse_connect.get_client(
-            url=CLICKHOUSE_URL,
-            username=os.getenv("CLICKHOUSE_USER", ""),
-            password=os.getenv("CLICKHOUSE_PASSWORD", ""),
-            verify=True,
-        )
-    elif CH_HOST:
-        # Self-hosted
-        _CH_CLIENT = clickhouse_connect.get_client(
-            host=CH_HOST,
-            port=CH_PORT,
-            username=CH_USER or "",
-            password=CH_PASSWORD or "",
-        )
-    else:
-        raise RuntimeError("Brak konfiguracji ClickHouse. Ustaw CLICKHOUSE_URL lub CH_HOST/CH_PORT/CH_USER/CH_PASSWORD.")
+    if not CLICKHOUSE_URL:
+        raise RuntimeError("Env CLICKHOUSE_URL is empty")
 
+    u = urlparse(CLICKHOUSE_URL.strip())
+    if u.scheme not in ("http", "https"):
+        raise RuntimeError(f"CLICKHOUSE_URL must start with http(s)://, got: {CLICKHOUSE_URL}")
+
+    host = u.hostname
+    port = u.port or (8443 if u.scheme == "https" else 8123)
+    interface = "https" if u.scheme == "https" else "http"
+
+    _CH_CLIENT = clickhouse_connect.get_client(
+        host=host,
+        port=port,
+        interface=interface,           # KLUCZOWE — zamiast url
+        username=CLICKHOUSE_USER,
+        password=CLICKHOUSE_PASSWORD,
+        database=CLICKHOUSE_DATABASE,
+        verify=True                    # w CH Cloud po https
+    )
     return _CH_CLIENT
 
 

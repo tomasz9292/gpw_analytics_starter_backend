@@ -1,184 +1,331 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+import io
+import os
+import zipfile
+from datetime import date, datetime
+from typing import List, Literal, Optional, Tuple
+
+import duckdb
+import numpy as np
+import pandas as pd
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-import zipfile, io, os, pandas as pd
-from datetime import datetime
+from pydantic import BaseModel
 
-# --- Try ClickHouse; if not configured, fallback to DuckDB ---
-USE_CLICKHOUSE = all(os.getenv(k) for k in ["CH_HOST", "CH_PORT", "CH_USER"])
-ch_client = None
-duck = None
+# ──────────────────────────────────────────────────────────────────────────────
+# Konfiguracja bazy (DuckDB na dysku). Render ma RW w /opt/render/project/src/
+# ──────────────────────────────────────────────────────────────────────────────
+DATA_DIR = os.environ.get("DATA_DIR", "./data")
+os.makedirs(DATA_DIR, exist_ok=True)
+DUCK_PATH = os.path.join(DATA_DIR, "duck.db")
 
-if USE_CLICKHOUSE:
-    import clickhouse_connect
-else:
-    import duckdb
+def get_duck() -> duckdb.DuckDBPyConnection:
+    con = duckdb.connect(DUCK_PATH, read_only=False)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS candles (
+            symbol VARCHAR,
+            d DATE,
+            open DOUBLE,
+            high DOUBLE,
+            low DOUBLE,
+            close DOUBLE,
+            volume BIGINT
+        );
+    """)
+    # Dla szybkich zapytań
+    con.execute("CREATE INDEX IF NOT EXISTS idx_candles_symbol_date ON candles(symbol, d);")
+    return con
 
+# ──────────────────────────────────────────────────────────────────────────────
+# FastAPI + CORS
+# ──────────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="GPW Analytics API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=["*"],  # w razie czego zawęź do swojego frontu
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-@app.get("/ping")
-def ping():
-    return {"status": "ok", "storage": "clickhouse" if USE_CLICKHOUSE else "duckdb"}
-
-def get_clickhouse():
-    global ch_client
-    if ch_client is None:
-        ch_client = clickhouse_connect.get_client(
-            host=os.getenv("CH_HOST"),
-            port=int(os.getenv("CH_PORT", "8123")),
-            username=os.getenv("CH_USER"),
-            password=os.getenv("CH_PASSWORD", ""),
-            database=os.getenv("CH_DATABASE", "default"),
-        )
-        # tabela jeśli brak
-        ch_client.command("""
-        CREATE TABLE IF NOT EXISTS quotes (
-            symbol String,
-            date Date,
-            open Float64, high Float64, low Float64, close Float64, volume UInt64
-        ) ENGINE = MergeTree()
-        ORDER BY (symbol, date)
-        """)
-    return ch_client
-
-def get_duck():
-    global duck
-    if duck is None:
-        # Render ma fs efemeryczny, ale wystarczy do testów; zmień ścieżkę jeśli chcesz
-        path = os.getenv("DUCKDB_PATH", "/var/tmp/gpw.duckdb")
-        duck = duckdb.connect(path)
-        duck.execute("""
-            CREATE TABLE IF NOT EXISTS quotes(
-                symbol TEXT,
-                date DATE,
-                open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, volume BIGINT
-            )
-        """)
-    return duck
-
-def ensure_storage():
-    if USE_CLICKHOUSE:
-        return "clickhouse", get_clickhouse()
-    return "duckdb", get_duck()
-
-def parse_mst(content: bytes) -> pd.DataFrame:
+# ──────────────────────────────────────────────────────────────────────────────
+# Pomocnicze: parser plików .mst ze Stooq (YYYYMMDD;O;H;L;C;V)
+# ──────────────────────────────────────────────────────────────────────────────
+def parse_mst_bytes(sym: str, raw: bytes) -> pd.DataFrame:
     """
-    Parser plików Stooq .mst (z mstall.zip).
-    Obsługuje nagłówek w formacie: <TICKER>,<PER>,<DATE>,<TIME>,<OPEN>,<HIGH>,<LOW>,<CLOSE>,<VOL>
-    oraz różne delimitery: ',', ';', tab.
-    Zwraca kolumny: date, open, high, low, close, volume
+    Minimalny parser formatu *.mst (Stooq).
+    Zakładamy kolumny w kolejności:
+      DATE ; OPEN ; HIGH ; LOW ; CLOSE ; VOLUME
+    gdzie DATE to YYYYMMDD (int/str).
+    Czasem pierwszy wiersz bywa nagłówkiem — filtrujemy wszystko,
+    co nie wygląda na 8-znakową datę.
     """
-    txt = content.decode("utf-8", errors="ignore").lstrip("\ufeff")
-    # wybierz delimiter
-    if ";" in txt.splitlines()[0]:
-        sep = ";"
-    elif "\t" in txt.splitlines()[0]:
-        sep = "\t"
-    else:
-        sep = ","
+    text = raw.decode("utf-8", errors="ignore").replace("\r", "")
+    lines = [ln for ln in text.split("\n") if ln.strip()]
+    rows: List[Tuple[str, float, float, float, float, int]] = []
+    for ln in lines:
+        parts = [p.strip() for p in ln.split(";")]
+        if len(parts) < 6:
+            continue
+        d_raw = parts[0]
+        # tylko daty 8-znakowe
+        if not (len(d_raw) == 8 and d_raw.isdigit()):
+            continue
+        try:
+            d = datetime.strptime(d_raw, "%Y%m%d").date()
+            o = float(parts[1]); h = float(parts[2]); l = float(parts[3]); c = float(parts[4])
+            v = int(float(parts[5]))
+            rows.append((sym, d, o, h, l, c, v))
+        except Exception:
+            # ignoruj rzędy z błędami
+            continue
+    if not rows:
+        return pd.DataFrame(columns=["symbol", "d", "open", "high", "low", "close", "volume"])
+    df = pd.DataFrame(rows, columns=["symbol", "d", "open", "high", "low", "close", "volume"])
+    # usuwamy duplikaty tej samej daty
+    df = df.sort_values("d").drop_duplicates(subset=["symbol", "d"], keep="last")
+    return df
 
-    # Spróbuj z nagłówkiem Stooq
-    cols_stooq = ["<TICKER>", "<PER>", "<DATE>", "<TIME>", "<OPEN>", "<HIGH>", "<LOW>", "<CLOSE>", "<VOL>"]
-    first_line = txt.splitlines()[0].strip()
+# ──────────────────────────────────────────────────────────────────────────────
+# Upload ZIP z plikami *.mst i ingest do DuckDB
+# ──────────────────────────────────────────────────────────────────────────────
+class IngestResult(BaseModel):
+    files_seen: int
+    files_loaded: int
+    rows_inserted: int
 
-    if all(c in first_line for c in ["<DATE>", "<OPEN>", "<CLOSE>"]):
-        df = pd.read_csv(io.StringIO(txt), sep=sep)
-        # odfiltruj ewentualne puste i wiersze nagłówka powtórzone w środku
-        df = df.loc[~df["<DATE>"].astype(str).str.startswith("<")]
-
-        # konwersje
-        df["date"] = pd.to_datetime(df["<DATE>"].astype(str), format="%Y%m%d", errors="coerce").dt.date
-        df["open"] = pd.to_numeric(df["<OPEN>"], errors="coerce")
-        df["high"] = pd.to_numeric(df["<HIGH>"], errors="coerce")
-        df["low"]  = pd.to_numeric(df["<LOW>"], errors="coerce")
-        df["close"]= pd.to_numeric(df["<CLOSE>"], errors="coerce")
-        df["volume"]=pd.to_numeric(df.get("<VOL>", 0), errors="coerce").fillna(0).astype("Int64")
-
-        df = df[["date","open","high","low","close","volume"]].dropna(subset=["date","close"])
-        return df.reset_index(drop=True)
-
-    # Fallback: brak nagłówka – 6 kolumn: date, open, high, low, close, volume
-    df = pd.read_csv(
-        io.StringIO(txt), sep=sep, header=None,
-        names=["date","open","high","low","close","volume"],
-        engine="python"
-    )
-    # niektóre pliki mogą mieć w pierwszym wierszu znaczniki w <> — odfiltruj
-    df = df.loc[~df["date"].astype(str).str.startswith("<")]
-
-    # data jako %Y%m%d
-    df["date"] = pd.to_datetime(df["date"].astype(str), format="%Y%m%d", errors="coerce").dt.date
-    for c in ["open","high","low","close","volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["volume"] = df["volume"].fillna(0).astype("Int64")
-
-    df = df.dropna(subset=["date","close"])
-    return df[["date","open","high","low","close","volume"]].reset_index(drop=True)
-
-
-@app.post("/ingest/stooq-zip")
+@app.post("/ingest/stooq-zip", response_model=IngestResult, summary="Wgraj ZIP z plikami *.mst")
 async def ingest_stooq_zip(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".zip"):
-        raise HTTPException(400, "Prześlij plik ZIP")
-
-    storage, conn = ensure_storage()
+        raise HTTPException(status_code=400, detail="Podaj plik ZIP.")
 
     data = await file.read()
-    zf = zipfile.ZipFile(io.BytesIO(data))
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="Uszkodzony ZIP.")
 
-    files_total = 0
-    files_ok = 0
-    files_skipped = 0
+    con = get_duck()
+    files_seen = 0
+    files_loaded = 0
     rows_inserted = 0
-    errors = []
 
     for name in zf.namelist():
         if not name.lower().endswith(".mst"):
             continue
-        files_total += 1
+        files_seen += 1
+        sym = os.path.basename(name).split(".")[0].upper()
+
         try:
-            content = zf.read(name)
-            df = parse_mst(content)
+            raw = zf.read(name)
+            df = parse_mst_bytes(sym, raw)
             if df.empty:
-                files_skipped += 1
                 continue
-            symbol = os.path.splitext(os.path.basename(name))[0].upper()
-            df["symbol"] = symbol
 
-            if storage == "clickhouse":
-                recs = df[["symbol","date","open","high","low","close","volume"]].values.tolist()
-                conn.insert(
-                    "quotes", recs,
-                    column_names=["symbol","date","open","high","low","close","volume"]
-                )
+            # Insert — aby uniknąć duplikatów, kasujemy istniejące rzędy dla (symbol, d) które wstawiamy
+            # (DuckDB nie ma INSERT OR REPLACE – robimy MERGE przez temp table)
+            con.execute("CREATE TEMP TABLE tmp_load AS SELECT * FROM df", {"df": df})
+            con.execute("""
+                DELETE FROM candles
+                USING tmp_load
+                WHERE candles.symbol = tmp_load.symbol AND candles.d = tmp_load.d
+            """)
+            con.execute("INSERT INTO candles SELECT * FROM tmp_load")
+            ins = con.execute("SELECT COUNT(*) FROM tmp_load").fetchone()[0]
+            rows_inserted += int(ins)
+            con.execute("DROP TABLE tmp_load")
+            files_loaded += 1
+        except Exception:
+            # błąd konkretnego pliku – ignorujemy, lecimy dalej
+            continue
+
+    return IngestResult(files_seen=files_seen, files_loaded=files_loaded, rows_inserted=rows_inserted)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Endpointy dla frontu
+# ──────────────────────────────────────────────────────────────────────────────
+class QuoteRow(BaseModel):
+    date: date
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: int
+
+@app.get("/quotes", response_model=List[QuoteRow], summary="Notowania 1D dla spółki")
+def quotes(
+    symbol: str = Query(..., description="Ticker, np. CDR.WA"),
+    start: Optional[date] = Query(None, description="Początek zakresu (YYYY-MM-DD)")
+):
+    con = get_duck()
+    if start:
+        q = """
+            SELECT d AS date, open, high, low, close, volume
+            FROM candles
+            WHERE symbol = ? AND d >= ?
+            ORDER BY d
+        """
+        df = con.execute(q, [symbol.upper(), start]).df()
+    else:
+        q = """
+            SELECT d AS date, open, high, low, close, volume
+            FROM candles
+            WHERE symbol = ?
+            ORDER BY d
+        """
+        df = con.execute(q, [symbol.upper()]).df()
+
+    # Konwersje typów pod Pydantic
+    out = [
+        QuoteRow(
+            date=pd.to_datetime(r["date"]).date(),
+            open=float(r["open"]),
+            high=float(r["high"]),
+            low=float(r["low"]),
+            close=float(r["close"]),
+            volume=int(r["volume"]),
+        )
+        for _, r in df.iterrows()
+    ]
+    return out
+
+class SymbolRow(BaseModel):
+    symbol: str
+    name: str
+
+@app.get("/symbols", response_model=List[SymbolRow], summary="Lista tickerów (z filtem q=)")
+def symbols(q: Optional[str] = Query(None, description="Prefiks lub fragment, np. 'PK'")):
+    con = get_duck()
+    if q:
+        df = con.execute(
+            "SELECT DISTINCT symbol FROM candles WHERE symbol ILIKE ? ORDER BY symbol",
+            [f"%{q.upper()}%"],
+        ).df()
+    else:
+        df = con.execute("SELECT DISTINCT symbol FROM candles ORDER BY symbol").df()
+
+    return [SymbolRow(symbol=s, name=s) for s in df["symbol"].tolist()]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Backtest portfela (equity + podstawowe statystyki)
+# ──────────────────────────────────────────────────────────────────────────────
+class PortfolioPoint(BaseModel):
+    date: date
+    value: float
+
+class PortfolioStats(BaseModel):
+    cagr: float
+    max_drawdown: float
+    volatility: float
+    sharpe: float
+    last_value: float
+
+class PortfolioResp(BaseModel):
+    equity: List[PortfolioPoint]
+    stats: PortfolioStats
+
+def _rebal_dates(dates: pd.DatetimeIndex, freq: Literal["none","monthly","quarterly","yearly"]) -> pd.Index:
+    if freq == "none":
+        return pd.Index([])
+    if freq == "monthly":
+        return dates.to_period("M").drop_duplicates().to_timestamp(how="end")
+    if freq == "quarterly":
+        return dates.to_period("Q").drop_duplicates().to_timestamp(how="end")
+    if freq == "yearly":
+        return dates.to_period("Y").drop_duplicates().to_timestamp(how="end")
+    return pd.Index([])
+
+@app.get("/backtest/portfolio", response_model=PortfolioResp, summary="Backtest portfela")
+def backtest_portfolio(
+    symbols: str = Query(..., description="CSV tickerów, np. CDR.WA,PKO.WA"),
+    weights: str = Query(..., description="CSV wag w %, np. 40,30,30"),
+    start: date = Query(..., description="Start (YYYY-MM-DD)"),
+    rebalance: Literal["none", "monthly", "quarterly", "yearly"] = Query("monthly")
+):
+    syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    w_raw = [float(x) for x in weights.split(",")]
+    if len(syms) == 0 or len(syms) != len(w_raw):
+        raise HTTPException(status_code=400, detail="Liczba symboli musi odpowiadać liczbie wag.")
+    w = np.array(w_raw, dtype=float)
+    if w.sum() <= 0:
+        raise HTTPException(status_code=400, detail="Wagi muszą być dodatnie.")
+    w = w / w.sum()  # normalizacja do 1.0
+
+    # pobierz zamknięcia, utnij do wspólnych dat
+    con = get_duck()
+    frames = []
+    for s in syms:
+        df = con.execute(
+            "SELECT d AS date, close FROM candles WHERE symbol=? AND d>=? ORDER BY d",
+            [s, start],
+        ).df()
+        if df.empty:
+            raise HTTPException(status_code=404, detail=f"Brak danych dla {s}")
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date").rename(columns={"close": s})
+        frames.append(df)
+
+    # join po wspólnym indeksie
+    mat = pd.concat(frames, axis=1, join="inner").sort_index()
+    if mat.empty or len(mat.columns) != len(syms):
+        raise HTTPException(status_code=404, detail="Brak wspólnych notowań dla wszystkich spółek.")
+
+    # dzienne stopy zwrotu
+    rets = mat.pct_change().fillna(0.0)
+    dates = rets.index
+
+    # rebalancing
+    rebal_on = set(_rebal_dates(dates, rebalance))
+    port_val = [1.0]  # start = 1.0
+    cur_w = w.copy()
+
+    for i in range(1, len(rets)):
+        r_vec = rets.iloc[i].values  # dzienny zwrot każdej spółki
+        pv_prev = port_val[-1]
+        pv_next = pv_prev * float(1.0 + np.dot(cur_w, r_vec))
+        port_val.append(pv_next)
+
+        # rebalansujemy na koniec okresu (po naliczeniu)
+        dt = dates[i]
+        if dt.normalize().to_pydatetime() in rebal_on:
+            cur_w = w.copy()
+
+        else:
+            # dryf wag (po wzroście/spadku)
+            # nowe "udziały" = w_t * (1+r_i) i normalizacja
+            grown = cur_w * (1.0 + r_vec)
+            s = grown.sum()
+            if s > 0:
+                cur_w = grown / s
             else:
-                # DuckDB – wstawka przez pandas
-                conn.execute("BEGIN")
-                conn.register("tmp_df", df)
-                conn.execute("""
-                    INSERT INTO quotes
-                    SELECT symbol, date, open, high, low, close, CAST(volume AS BIGINT)
-                    FROM tmp_df
-                """)
-                conn.execute("COMMIT")
-                conn.unregister("tmp_df")
+                cur_w = w.copy()
 
-            rows_inserted += len(df)
-            files_ok += 1
-        except Exception as e:
-            errors.append(f"{name}: {e}")
+    equity = pd.Series(port_val, index=dates)
 
-    return {
-        "storage": storage,
-        "files_total": files_total,
-        "files_ok": files_ok,
-        "files_skipped": files_skipped,
-        "rows_inserted": rows_inserted,
-        "errors": errors,
-        "timestamp": datetime.utcnow().isoformat()+"Z",
-    }
+    # statystyki
+    yrs = (equity.index[-1] - equity.index[0]).days / 365.25
+    last_val = float(equity.iloc[-1])
+    cagr = (last_val ** (1 / yrs) - 1.0) if yrs > 0 else 0.0
+    dd = (equity / equity.cummax() - 1.0).min()
+    daily_std = rets.dot(w).std()
+    vol = float(daily_std * np.sqrt(252))
+    sharpe = float((cagr - 0.0) / vol) if vol > 1e-9 else 0.0
+
+    resp = PortfolioResp(
+        equity=[PortfolioPoint(date=d.to_pydatetime().date(), value=float(v)) for d, v in equity.items()],
+        stats=PortfolioStats(
+            cagr=float(cagr),
+            max_drawdown=float(abs(dd)),
+            volatility=float(vol),
+            sharpe=float(sharpe),
+            last_value=last_val,
+        ),
+    )
+    return resp
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Prosty ping
+# ──────────────────────────────────────────────────────────────────────────────
+@app.get("/ping")
+def ping():
+    return {"status": "ok", "storage": "duckdb", "db_path": DUCK_PATH}

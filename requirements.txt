@@ -1,6 +1,5 @@
 fastapi
-uvicorn
-clickhouse-connect
-psycopg[binary]
+uvicorn[standard]
 pandas
-yfinance
+clickhouse-connect
+python-multipart

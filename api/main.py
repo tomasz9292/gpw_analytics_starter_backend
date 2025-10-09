@@ -4,10 +4,11 @@ from __future__ import annotations
 import io
 import os
 from datetime import date, datetime
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
+
+from urllib.parse import parse_qs, urlparse
 
 import clickhouse_connect
-from urllib.parse import urlparse
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -18,21 +19,114 @@ from pydantic import BaseModel
 
 TABLE_OHLC = os.getenv("TABLE_OHLC", "ohlc")
 
-# Wariant 1 – ClickHouse Cloud (jedno pole URL) np. https://abc123.us-east-1.aws.clickhouse.cloud:8443
-CLICKHOUSE_URL = os.getenv("CLICKHOUSE_URL", "")      # np. https://abc123.eu-west-1.aws.clickhouse.cloud:8443
-CLICKHOUSE_USER = os.getenv("CLICKHOUSE_USER", "default")
-CLICKHOUSE_PASSWORD = os.getenv("CLICKHOUSE_PASSWORD", "")
-CLICKHOUSE_DATABASE = os.getenv("CLICKHOUSE_DATABASE", "default")
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Pomocniczo odczytuje wartości bool z env."""
+
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
 
 
-# Wariant 2 – Self-hosted
-CH_HOST = os.getenv("CH_HOST")
-CH_PORT = int(os.getenv("CH_PORT", "8123"))
-CH_USER = os.getenv("CH_USER")
-CH_PASSWORD = os.getenv("CH_PASSWORD")
+# Wariant 1 – pełny URL (np. https://abc123.eu-west-1.aws.clickhouse.cloud:8443)
+CLICKHOUSE_URL = os.getenv("CLICKHOUSE_URL", "").strip()
+
+# Wariant 2 – oddzielne pola. Działają także razem z URL, ale
+# mogą nadpisywać wartości (np. inny user/hasło niż w URL).
+CLICKHOUSE_HOST = os.getenv("CLICKHOUSE_HOST", "").strip()
+CLICKHOUSE_PORT = os.getenv("CLICKHOUSE_PORT", "").strip()
+CLICKHOUSE_DATABASE = os.getenv("CLICKHOUSE_DATABASE", "default").strip()
+CLICKHOUSE_USER = os.getenv("CLICKHOUSE_USER", "default").strip()
+CLICKHOUSE_PASSWORD = os.getenv("CLICKHOUSE_PASSWORD", "").strip()
+
+# Flagi TLS/SSL – przydają się na Render/Cloud.
+CLICKHOUSE_SECURE = _env_bool("CLICKHOUSE_SECURE", default=True)
+CLICKHOUSE_VERIFY = _env_bool("CLICKHOUSE_VERIFY", default=True)
+CLICKHOUSE_CA = os.getenv("CLICKHOUSE_CA", "").strip()  # ścieżka do dodatkowego certyfikatu, opcjonalna
+
+# CORS – domyślnie pozwalamy wszystkim, ale można podać np. domenę z Vercel.
+_cors_origins = os.getenv("CORS_ALLOW_ORIGINS", "*").strip()
+if _cors_origins == "*":
+    CORS_ALLOW_ORIGINS: List[str] = ["*"]
+else:
+    CORS_ALLOW_ORIGINS = [origin.strip() for origin in _cors_origins.split(",") if origin.strip()]
+
 
 # Prosty cache klienta
 _CH_CLIENT = None
+
+
+def _str_to_bool(value: str, default: bool) -> bool:
+    low = value.strip().lower()
+    if low in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if low in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _parse_clickhouse_url():
+    """Zwraca słownik parametrów wyciągniętych z CLICKHOUSE_URL."""
+
+    if not CLICKHOUSE_URL:
+        return None
+
+    u = urlparse(CLICKHOUSE_URL)
+    query = parse_qs(u.query)
+
+    def _query_last(*names: str) -> Optional[str]:
+        for n in names:
+            if n in query and query[n]:
+                return query[n][-1]
+        return None
+
+    if u.scheme in {"http", "https"}:
+        secure_default = u.scheme == "https"
+    elif u.scheme in {"clickhouse", "clickhouses"}:
+        secure_default = u.scheme == "clickhouses"
+    else:
+        raise RuntimeError(
+            "CLICKHOUSE_URL must start with http(s):// or clickhouse(s)://, got: "
+            f"{CLICKHOUSE_URL}"
+        )
+
+    host = u.hostname or ""
+    if not host:
+        raise RuntimeError("CLICKHOUSE_URL musi zawierać hosta")
+
+    port_default = 8443 if secure_default else 8123
+    port = u.port or port_default
+
+    secure = secure_default
+    secure_q = _query_last("secure", "ssl")
+    if secure_q is not None:
+        secure = _str_to_bool(secure_q, secure_default)
+
+    verify = None
+    verify_q = _query_last("verify", "check")
+    if verify_q is not None:
+        verify = _str_to_bool(verify_q, secure)
+
+    username = u.username or _query_last("username", "user")
+    password = u.password or _query_last("password", "pass")
+
+    database = None
+    if u.path and u.path != "/":
+        database = u.path.lstrip("/")
+    database_q = _query_last("database", "db")
+    if database_q:
+        database = database_q
+
+    return {
+        "host": host,
+        "port": port,
+        "secure": secure,
+        "verify": verify,
+        "username": username,
+        "password": password,
+        "database": database,
+    }
 
 
 def get_ch():
@@ -40,26 +134,53 @@ def get_ch():
     if _CH_CLIENT is not None:
         return _CH_CLIENT
 
-    if not CLICKHOUSE_URL:
-        raise RuntimeError("Env CLICKHOUSE_URL is empty")
+    parsed = _parse_clickhouse_url()
 
-    u = urlparse(CLICKHOUSE_URL.strip())
-    if u.scheme not in ("http", "https"):
-        raise RuntimeError(f"CLICKHOUSE_URL must start with http(s)://, got: {CLICKHOUSE_URL}")
+    if parsed:
+        host = parsed["host"]
+        port = parsed["port"]
+        secure = parsed["secure"]
+        username = parsed.get("username") or CLICKHOUSE_USER
+        password = parsed.get("password") or CLICKHOUSE_PASSWORD
+        database = parsed.get("database") or CLICKHOUSE_DATABASE
+        verify = (
+            parsed["verify"]
+            if parsed.get("verify") is not None
+            else (CLICKHOUSE_VERIFY if secure else False)
+        )
+    else:
+        host = CLICKHOUSE_HOST
+        if not host:
+            raise RuntimeError(
+                "Brak konfiguracji ClickHouse. Ustaw CLICKHOUSE_URL lub CLICKHOUSE_HOST"
+            )
+        try:
+            port = int(CLICKHOUSE_PORT or (8443 if CLICKHOUSE_SECURE else 8123))
+        except ValueError as exc:
+            raise RuntimeError("CLICKHOUSE_PORT musi być liczbą całkowitą") from exc
+        secure = CLICKHOUSE_SECURE
+        username = CLICKHOUSE_USER
+        password = CLICKHOUSE_PASSWORD
+        database = CLICKHOUSE_DATABASE
+        verify = CLICKHOUSE_VERIFY if secure else False
 
-    host = u.hostname
-    port = u.port or (8443 if u.scheme == "https" else 8123)
-    interface = "https" if u.scheme == "https" else "http"
+    interface = "https" if secure else "http"
 
-    _CH_CLIENT = clickhouse_connect.get_client(
-        host=host,
-        port=port,
-        interface=interface,           # KLUCZOWE — zamiast url
-        username=CLICKHOUSE_USER,
-        password=CLICKHOUSE_PASSWORD,
-        database=CLICKHOUSE_DATABASE,
-        verify=True                    # w CH Cloud po https
-    )
+    client_kwargs = {
+        "host": host,
+        "port": port,
+        "username": username,
+        "password": password,
+        "database": database,
+        "interface": interface,
+        "secure": secure,
+        "verify": verify,
+    }
+
+    if CLICKHOUSE_CA:
+        client_kwargs["ca_cert"] = CLICKHOUSE_CA
+
+    _CH_CLIENT = clickhouse_connect.get_client(**client_kwargs)
     return _CH_CLIENT
 
 
@@ -71,7 +192,7 @@ app = FastAPI(title="GPW Analytics API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # dopasuj wg potrzeb
+    allow_origins=CORS_ALLOW_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -238,12 +238,29 @@ def normalize_input_symbol(s: str) -> str:
     """
     Dla wejścia użytkownika zwraca surowy symbol (RAW) używany w bazie.
     Obsługuje zarówno 'CDR.WA' jak i 'CDPROJEKT'.
+
+    W praktyce użytkownicy często wpisują tickery małymi literami albo z
+    sufiksem .WA dla spółek z GPW.  Funkcja stara się więc:
+    - przywrócić RAW z mapy aliasów, jeśli go znamy,
+    - w przeciwnym razie, gdy ticker wygląda jak "XYZ.WA", uciąć sufiks i
+      zwrócić bazowy symbol,
+    - w ostateczności zwrócić wejście spójne wielkościowo (UPPER).
     """
-    if "." in s:
-        # Użytkownik podał ładny ticker – zamieniamy na RAW jeśli znamy alias
-        maybe = ALIASES_WA_TO_RAW.get(s.lower())
-        return maybe or s
-    return s
+
+    cleaned = s.strip()
+    if not cleaned:
+        return ""
+
+    maybe = ALIASES_WA_TO_RAW.get(cleaned.lower())
+    if maybe:
+        return maybe
+
+    if "." in cleaned:
+        base = cleaned.split(".", 1)[0].strip()
+        if base:
+            return base.upper()
+
+    return cleaned.upper()
 
 
 # =========================
@@ -332,6 +349,8 @@ def quotes(symbol: str, start: Optional[str] = None):
     Obsługuje zarówno 'CDR.WA' jak i 'CDPROJEKT'.
     """
     raw_symbol = normalize_input_symbol(symbol)
+    if not raw_symbol:
+        raise HTTPException(400, "symbol must not be empty")
 
     try:
         dt = date.fromisoformat(start) if start else date(2015, 1, 1)
@@ -535,7 +554,12 @@ def backtest_portfolio(
     if not syms_in:
         raise HTTPException(400, "Podaj co najmniej jeden symbol")
 
-    raw_syms: List[str] = [normalize_input_symbol(s) for s in syms_in]
+    raw_syms: List[str] = []
+    for s in syms_in:
+        raw = normalize_input_symbol(s)
+        if not raw:
+            raise HTTPException(400, "Symbol nie może być pusty")
+        raw_syms.append(raw)
 
     try:
         dt_start = date.fromisoformat(start)

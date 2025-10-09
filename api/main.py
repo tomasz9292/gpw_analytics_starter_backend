@@ -301,7 +301,7 @@ def symbols(
             ORDER BY symbol
             LIMIT %(limit)s
             """,
-            params={"q": q, "limit": limit},
+            parameters={"q": q, "limit": limit},
         ).result_rows
     else:
         rows = ch.query(
@@ -311,7 +311,7 @@ def symbols(
             ORDER BY symbol
             LIMIT %(limit)s
             """,
-            params={"limit": limit},
+            parameters={"limit": limit},
         ).result_rows
 
     out = []
@@ -346,7 +346,7 @@ def quotes(symbol: str, start: Optional[str] = None):
         WHERE symbol = %(sym)s AND date >= %(dt)s
         ORDER BY date
         """,
-        params={"sym": raw_symbol, "dt": dt},
+        parameters={"sym": raw_symbol, "dt": dt},
     ).named_results()
 
     out: List[QuoteRow] = []
@@ -379,7 +379,7 @@ def _fetch_close_series(ch_client, raw_symbol: str, start: date) -> List[Tuple[s
         WHERE symbol = %(sym)s AND date >= %(dt)s
         ORDER BY date
         """,
-        params={"sym": raw_symbol, "dt": start},
+        parameters={"sym": raw_symbol, "dt": start},
     ).result_rows
     return [(str(d), float(c)) for (d, c) in rows]
 

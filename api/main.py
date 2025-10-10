@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 import clickhouse_connect
+import threading
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
@@ -54,8 +55,10 @@ else:
     CORS_ALLOW_ORIGINS = [origin.strip() for origin in _cors_origins.split(",") if origin.strip()]
 
 
-# Prosty cache klienta
-_CH_CLIENT = None
+# Cache konfiguracji klienta ClickHouse + klienci per wątek
+_CH_CLIENT_KWARGS = None
+_CH_CLIENT_LOCK = threading.Lock()
+_THREAD_LOCAL = threading.local()
 
 
 def _str_to_bool(value: str, default: bool) -> bool:
@@ -130,59 +133,74 @@ def _parse_clickhouse_url():
     }
 
 
-def get_ch():
-    global _CH_CLIENT
-    if _CH_CLIENT is not None:
-        return _CH_CLIENT
+def _get_ch_client_kwargs():
+    global _CH_CLIENT_KWARGS
+    if _CH_CLIENT_KWARGS is not None:
+        return _CH_CLIENT_KWARGS
 
-    parsed = _parse_clickhouse_url()
+    with _CH_CLIENT_LOCK:
+        if _CH_CLIENT_KWARGS is not None:
+            return _CH_CLIENT_KWARGS
 
-    if parsed:
-        host = parsed["host"]
-        port = parsed["port"]
-        secure = parsed["secure"]
-        username = parsed.get("username") or CLICKHOUSE_USER
-        password = parsed.get("password") or CLICKHOUSE_PASSWORD
-        database = parsed.get("database") or CLICKHOUSE_DATABASE
-        verify = (
-            parsed["verify"]
-            if parsed.get("verify") is not None
-            else (CLICKHOUSE_VERIFY if secure else False)
-        )
-    else:
-        host = CLICKHOUSE_HOST
-        if not host:
-            raise RuntimeError(
-                "Brak konfiguracji ClickHouse. Ustaw CLICKHOUSE_URL lub CLICKHOUSE_HOST"
+        parsed = _parse_clickhouse_url()
+
+        if parsed:
+            host = parsed["host"]
+            port = parsed["port"]
+            secure = parsed["secure"]
+            username = parsed.get("username") or CLICKHOUSE_USER
+            password = parsed.get("password") or CLICKHOUSE_PASSWORD
+            database = parsed.get("database") or CLICKHOUSE_DATABASE
+            verify = (
+                parsed["verify"]
+                if parsed.get("verify") is not None
+                else (CLICKHOUSE_VERIFY if secure else False)
             )
-        try:
-            port = int(CLICKHOUSE_PORT or (8443 if CLICKHOUSE_SECURE else 8123))
-        except ValueError as exc:
-            raise RuntimeError("CLICKHOUSE_PORT musi być liczbą całkowitą") from exc
-        secure = CLICKHOUSE_SECURE
-        username = CLICKHOUSE_USER
-        password = CLICKHOUSE_PASSWORD
-        database = CLICKHOUSE_DATABASE
-        verify = CLICKHOUSE_VERIFY if secure else False
+        else:
+            host = CLICKHOUSE_HOST
+            if not host:
+                raise RuntimeError(
+                    "Brak konfiguracji ClickHouse. Ustaw CLICKHOUSE_URL lub CLICKHOUSE_HOST"
+                )
+            try:
+                port = int(CLICKHOUSE_PORT or (8443 if CLICKHOUSE_SECURE else 8123))
+            except ValueError as exc:
+                raise RuntimeError("CLICKHOUSE_PORT musi być liczbą całkowitą") from exc
+            secure = CLICKHOUSE_SECURE
+            username = CLICKHOUSE_USER
+            password = CLICKHOUSE_PASSWORD
+            database = CLICKHOUSE_DATABASE
+            verify = CLICKHOUSE_VERIFY if secure else False
 
-    interface = "https" if secure else "http"
+        interface = "https" if secure else "http"
 
-    client_kwargs = {
-        "host": host,
-        "port": port,
-        "username": username,
-        "password": password,
-        "database": database,
-        "interface": interface,
-        "secure": secure,
-        "verify": verify,
-    }
+        client_kwargs = {
+            "host": host,
+            "port": port,
+            "username": username,
+            "password": password,
+            "database": database,
+            "interface": interface,
+            "secure": secure,
+            "verify": verify,
+        }
 
-    if CLICKHOUSE_CA:
-        client_kwargs["ca_cert"] = CLICKHOUSE_CA
+        if CLICKHOUSE_CA:
+            client_kwargs["ca_cert"] = CLICKHOUSE_CA
 
-    _CH_CLIENT = clickhouse_connect.get_client(**client_kwargs)
-    return _CH_CLIENT
+        _CH_CLIENT_KWARGS = client_kwargs
+        return _CH_CLIENT_KWARGS
+
+
+def get_ch():
+    client = getattr(_THREAD_LOCAL, "ch_client", None)
+    if client is not None:
+        return client
+
+    client_kwargs = _get_ch_client_kwargs()
+    client = clickhouse_connect.get_client(**client_kwargs)
+    _THREAD_LOCAL.ch_client = client
+    return client
 
 
 # =========================

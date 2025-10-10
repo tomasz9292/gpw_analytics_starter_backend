@@ -373,6 +373,40 @@ class BacktestPortfolioRequest(BaseModel):
         return self
 
 
+class RangeDescriptor(BaseModel):
+    min: float
+    max: float
+    step: Optional[float] = None
+    default: Optional[float] = None
+
+
+class ComponentDescriptor(BaseModel):
+    metric: str
+    label: str
+    description: str
+    lookback_days: RangeDescriptor
+    weight: RangeDescriptor
+
+
+class AutoSelectionDescriptor(BaseModel):
+    top_n: RangeDescriptor
+    weighting_modes: List[str]
+    components: List[ComponentDescriptor]
+    filters: Dict[str, str]
+
+
+class ManualSelectionDescriptor(BaseModel):
+    description: str
+    weights: str
+
+
+class BacktestPortfolioTooling(BaseModel):
+    start: str
+    rebalance_modes: List[str]
+    manual: ManualSelectionDescriptor
+    auto: AutoSelectionDescriptor
+
+
 # =========================
 # /symbols – lista tickerów
 # =========================
@@ -750,6 +784,30 @@ def backtest_portfolio(req: BacktestPortfolioRequest):
 
     Pola ``start`` (``YYYY-MM-DD``) i ``rebalance`` (``none`` | ``monthly`` |
     ``quarterly`` | ``yearly``) obowiązują w obu trybach.
+
+    Przykładowy request (tryb ``auto``) – identyczny jak w testach
+    integracyjnych – znajduje się w ``examples/backtest_portfolio_auto_request.json``:
+
+    .. code-block:: json
+
+        {
+          "start": "2023-01-01",
+          "rebalance": "none",
+          "auto": {
+            "top_n": 2,
+            "weighting": "equal",
+            "components": [
+              {
+                "lookback_days": 4,
+                "metric": "total_return",
+                "weight": 5
+              }
+            ],
+            "filters": {
+              "include": ["AAA", "DDD"]
+            }
+          }
+        }
     """
 
     dt_start = req.start
@@ -795,3 +853,45 @@ def backtest_portfolio(req: BacktestPortfolioRequest):
 
     equity, stats = _compute_backtest(closes_map, weights_list, dt_start, req.rebalance)
     return PortfolioResp(equity=equity, stats=stats)
+
+
+@app.get("/backtest/portfolio/tooling", response_model=BacktestPortfolioTooling)
+def backtest_portfolio_tooling():
+    """Zwraca metadane pomagające zbudować formularz do backtestów.
+
+    Ułatwia frontendom przygotowanie list rozwijanych i opisów pól, tak aby
+    użytkownicy mogli szybciej złożyć poprawny request ``/backtest/portfolio``.
+    """
+
+    return BacktestPortfolioTooling(
+        start=date(2015, 1, 1).isoformat(),
+        rebalance_modes=["none", "monthly", "quarterly", "yearly"],
+        manual=ManualSelectionDescriptor(
+            description="Podaj listę symboli w formacie GPW (np. CDR.WA).",
+            weights=(
+                "Opcjonalna lista wag – musi odpowiadać kolejności symboli. "
+                "Brak oznacza równy podział."
+            ),
+        ),
+        auto=AutoSelectionDescriptor(
+            top_n=RangeDescriptor(min=1, max=100, step=1, default=5),
+            weighting_modes=["equal", "score"],
+            components=[
+                ComponentDescriptor(
+                    metric="total_return",
+                    label="Skumulowana stopa zwrotu",
+                    description=(
+                        "Porównuje cenę końcową z wartością sprzed okresu "
+                        "lookback i normalizuje wynik (0-200%)."
+                    ),
+                    lookback_days=RangeDescriptor(min=1, max=3650, step=1, default=252),
+                    weight=RangeDescriptor(min=1, max=10, step=1, default=5),
+                )
+            ],
+            filters={
+                "include": "Lista symboli do rozważenia (priorytet nad prefixami).",
+                "exclude": "Symbole, które zostaną pominięte (po normalizacji).",
+                "prefixes": "Rozważaj tylko tickery zaczynające się od podanych prefiksów.",
+            },
+        ),
+    )

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import io
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 from urllib.parse import parse_qs, urlparse
@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlparse
 import clickhouse_connect
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # =========================
 # Konfiguracja / połączenie
@@ -298,6 +298,81 @@ class PortfolioResp(BaseModel):
     stats: PortfolioStats
 
 
+class ScoreComponent(BaseModel):
+    lookback_days: int = Field(..., ge=1, le=3650)
+    metric: str = Field(..., description="Typ metryki score'u (np. total_return)")
+    weight: int = Field(..., ge=1, le=10)
+
+    @field_validator("metric")
+    @classmethod
+    def _validate_metric(cls, value: str) -> str:
+        allowed = {"total_return"}
+        if value not in allowed:
+            raise ValueError(f"metric must be one of {sorted(allowed)}")
+        return value
+
+
+class UniverseFilters(BaseModel):
+    include: Optional[List[str]] = None
+    exclude: Optional[List[str]] = None
+    prefixes: Optional[List[str]] = None
+
+    @field_validator("include", "exclude", "prefixes", mode="before")
+    @classmethod
+    def _ensure_list(cls, value):
+        if value is None:
+            return value
+        if isinstance(value, str):
+            return [value]
+        return list(value)
+
+    @field_validator("include", "exclude", "prefixes")
+    @classmethod
+    def _cleanup(cls, value):
+        if value is None:
+            return value
+        cleaned: List[str] = []
+        for item in value:
+            cleaned_item = item.strip()
+            if not cleaned_item:
+                raise ValueError("filter values must not be empty")
+            cleaned.append(cleaned_item)
+        return cleaned
+
+
+class ManualPortfolioConfig(BaseModel):
+    symbols: List[str] = Field(..., min_length=1)
+    weights: Optional[List[float]] = None
+
+    @model_validator(mode="after")
+    def _validate_weights(self):
+        if self.weights is not None and len(self.weights) != len(self.symbols):
+            raise ValueError("Liczba wag musi odpowiadać liczbie symboli")
+        return self
+
+
+class AutoSelectionConfig(BaseModel):
+    top_n: int = Field(..., ge=1, le=100)
+    components: List[ScoreComponent] = Field(..., min_length=1)
+    filters: Optional[UniverseFilters] = None
+    weighting: str = Field("equal", pattern="^(equal|score)$")
+
+
+class BacktestPortfolioRequest(BaseModel):
+    start: date = Field(default=date(2015, 1, 1))
+    rebalance: str = Field("monthly", pattern="^(none|monthly|quarterly|yearly)$")
+    manual: Optional[ManualPortfolioConfig] = None
+    auto: Optional[AutoSelectionConfig] = None
+
+    @model_validator(mode="after")
+    def _validate_mode(self):
+        if self.manual and self.auto:
+            raise ValueError("Wybierz tylko jeden tryb: manual lub auto")
+        if not self.manual and not self.auto:
+            raise ValueError("Wymagany jest tryb manual lub auto")
+        return self
+
+
 # =========================
 # /symbols – lista tickerów
 # =========================
@@ -405,6 +480,125 @@ def _fetch_close_series(ch_client, raw_symbol: str, start: date) -> List[Tuple[s
         parameters={"sym": raw_symbol, "dt": start},
     ).result_rows
     return [(str(d), float(c)) for (d, c) in rows]
+
+
+def _fetch_close_history(ch_client, raw_symbol: str) -> List[Tuple[str, float]]:
+    rows = ch_client.query(
+        f"""
+        SELECT toString(date) AS date, close
+        FROM {TABLE_OHLC}
+        WHERE symbol = %(sym)s
+        ORDER BY date
+        """,
+        parameters={"sym": raw_symbol},
+    ).result_rows
+    return [(str(d), float(c)) for (d, c) in rows]
+
+
+def _normalize_return(value: float) -> float:
+    return max(0.0, min(2.0, 1.0 + value))
+
+
+def _compute_component_return(
+    closes: List[Tuple[str, float]], lookback_days: int
+) -> Optional[float]:
+    if not closes:
+        return None
+
+    last_date_str, last_close = closes[-1]
+    if last_close <= 0:
+        return None
+
+    last_dt = datetime.fromisoformat(last_date_str).date()
+    target_date = last_dt - timedelta(days=lookback_days)
+
+    base_close = None
+    for date_str, close in reversed(closes):
+        dt = datetime.fromisoformat(date_str).date()
+        if dt <= target_date:
+            if close > 0:
+                base_close = close
+            break
+
+    if base_close is None or base_close <= 0:
+        return None
+
+    return (last_close / base_close) - 1.0
+
+
+def _calculate_symbol_score(
+    ch_client, raw_symbol: str, components: List[ScoreComponent]
+) -> Optional[float]:
+    closes = _fetch_close_history(ch_client, raw_symbol)
+    if not closes:
+        return None
+
+    total = 0.0
+    for comp in components:
+        if comp.metric != "total_return":
+            continue
+        comp_ret = _compute_component_return(closes, comp.lookback_days)
+        if comp_ret is None:
+            return None
+        total += comp.weight * _normalize_return(comp_ret)
+
+    return total
+
+
+def _list_candidate_symbols(ch_client, filters: Optional[UniverseFilters]) -> List[str]:
+    rows = ch_client.query(
+        f"""
+        SELECT DISTINCT symbol
+        FROM {TABLE_OHLC}
+        ORDER BY symbol
+        """
+    ).result_rows
+    symbols = [str(r[0]) for r in rows]
+
+    if not filters:
+        return symbols
+
+    includes = None
+    if filters.include:
+        includes = {normalize_input_symbol(sym) for sym in filters.include}
+        includes = {sym for sym in includes if sym}
+        if not includes:
+            raise HTTPException(400, "Lista include nie zawiera poprawnych symboli")
+
+    excludes = set()
+    if filters.exclude:
+        excludes = {normalize_input_symbol(sym) for sym in filters.exclude}
+        excludes = {sym for sym in excludes if sym}
+
+    prefixes = None
+    if filters.prefixes:
+        prefixes = [p.strip().upper() for p in filters.prefixes if p.strip()]
+
+    filtered: List[str] = []
+    for sym in symbols:
+        if includes and sym not in includes:
+            continue
+        if sym in excludes:
+            continue
+        if prefixes and not any(sym.startswith(pref) for pref in prefixes):
+            continue
+        filtered.append(sym)
+
+    return filtered
+
+
+def _rank_symbols_by_score(
+    ch_client, candidates: List[str], components: List[ScoreComponent]
+) -> List[Tuple[str, float]]:
+    ranked: List[Tuple[str, float]] = []
+    for sym in candidates:
+        score = _calculate_symbol_score(ch_client, sym, components)
+        if score is None:
+            continue
+        ranked.append((sym, score))
+
+    ranked.sort(key=lambda item: item[1], reverse=True)
+    return ranked
 
 
 def _rebalance_dates(dates: List[str], freq: str) -> List[str]:
@@ -542,55 +736,62 @@ def _compute_backtest(
     return equity, stats
 
 
-@app.get("/backtest/portfolio", response_model=PortfolioResp)
-def backtest_portfolio(
-    symbols: str = Query(..., description="Lista symboli rozdzielona przecinkami (np. CDR.WA,PKN.WA)"),
-    weights: str = Query(..., description="Lista wag w % (np. 40,30,30)"),
-    start: str = Query("2015-01-01"),
-    rebalance: str = Query("monthly", pattern="^(none|monthly|quarterly|yearly)$"),
-):
+@app.post("/backtest/portfolio", response_model=PortfolioResp)
+def backtest_portfolio(req: BacktestPortfolioRequest):
+    """Backtest portfela na bazie kursów zamknięcia.
+
+    Parametry przekazujemy jako JSON z jednym z dwóch trybów:
+
+    - ``manual`` – lista symboli (np. ``["CDR.WA", "PKN.WA"]``) oraz opcjonalne
+      wagi ``weights`` (float). Brak wag oznacza równy podział.
+    - ``auto`` – konfiguracja automatycznego wyboru zawierająca ``top_n`` (liczba
+      spółek), ``components`` (lista słowników z polami ``lookback_days``,
+      ``metric`` i ``weight``) oraz opcjonalne ``filters`` wszechświata symboli.
+
+    Pola ``start`` (``YYYY-MM-DD``) i ``rebalance`` (``none`` | ``monthly`` |
+    ``quarterly`` | ``yearly``) obowiązują w obu trybach.
     """
-    Prosty backtest portfela po close'ach z rebalancingiem.
-    Obsługuje symbole w formacie RAW i .WA (mieszane).
-    """
-    # parse wejścia
-    syms_in: List[str] = [s.strip() for s in symbols.split(",") if s.strip()]
-    if not syms_in:
-        raise HTTPException(400, "Podaj co najmniej jeden symbol")
 
-    raw_syms: List[str] = []
-    for s in syms_in:
-        raw = normalize_input_symbol(s)
-        if not raw:
-            raise HTTPException(400, "Symbol nie może być pusty")
-        raw_syms.append(raw)
-
-    try:
-        dt_start = date.fromisoformat(start)
-    except Exception:
-        raise HTTPException(400, "start must be in format YYYY-MM-DD")
-
-    weights_list: List[float] = []
-    for w in weights.split(","):
-        w = w.strip()
-        if not w:
-            continue
-        try:
-            weights_list.append(float(w))
-        except Exception:
-            raise HTTPException(400, f"Nieprawidłowa waga: {w}")
-
-    if len(weights_list) != len(raw_syms):
-        raise HTTPException(400, "Liczba wag musi odpowiadać liczbie symboli")
-
+    dt_start = req.start
     ch = get_ch()
 
-    # pobierz serie close dla każdego symbolu
+    if req.manual:
+        raw_syms: List[str] = []
+        for s in req.manual.symbols:
+            raw = normalize_input_symbol(s)
+            if not raw:
+                raise HTTPException(400, "Symbol nie może być pusty")
+            raw_syms.append(raw)
+
+        weights_list = list(req.manual.weights) if req.manual.weights else [1.0] * len(raw_syms)
+    else:
+        assert req.auto is not None
+        candidates = _list_candidate_symbols(ch, req.auto.filters)
+        if not candidates:
+            raise HTTPException(404, "Brak symboli do oceny")
+
+        ranked = _rank_symbols_by_score(ch, candidates, req.auto.components)
+        if not ranked:
+            raise HTTPException(404, "Brak symboli ze wszystkimi wymaganymi danymi")
+
+        top = ranked[: req.auto.top_n]
+        raw_syms = [sym for sym, _ in top]
+        if not raw_syms:
+            raise HTTPException(404, "Brak symboli po filtrach")
+
+        if req.auto.weighting == "score":
+            weights_list = [score for _, score in top]
+            if not any(weights_list):
+                weights_list = [1.0] * len(top)
+        else:
+            weights_list = [1.0] * len(top)
+
     closes_map: Dict[str, List[Tuple[str, float]]] = {}
     for rs in raw_syms:
         series = _fetch_close_series(ch, rs, dt_start)
+        if not series:
+            raise HTTPException(404, f"Brak danych historycznych dla {rs}")
         closes_map[rs] = series
 
-    # policz backtest
-    equity, stats = _compute_backtest(closes_map, weights_list, dt_start, rebalance)
+    equity, stats = _compute_backtest(closes_map, weights_list, dt_start, req.rebalance)
     return PortfolioResp(equity=equity, stats=stats)

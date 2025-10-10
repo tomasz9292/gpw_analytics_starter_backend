@@ -317,6 +317,12 @@ class PortfolioResp(BaseModel):
     stats: PortfolioStats
 
 
+class PortfolioScoreItem(BaseModel):
+    symbol: str
+    raw: str
+    score: float
+
+
 class ScoreComponent(BaseModel):
     lookback_days: int = Field(..., ge=1, le=3650)
     metric: str = Field(..., description="Typ metryki score'u (np. total_return)")
@@ -424,6 +430,10 @@ class BacktestPortfolioTooling(BaseModel):
     rebalance_modes: List[str]
     manual: ManualSelectionDescriptor
     auto: AutoSelectionDescriptor
+
+
+class PortfolioScoreRequest(BaseModel):
+    auto: AutoSelectionConfig
 
 
 # =========================
@@ -835,6 +845,26 @@ def _run_backtest(req: BacktestPortfolioRequest) -> PortfolioResp:
     return PortfolioResp(equity=equity, stats=stats)
 
 
+def _compute_portfolio_score(req: PortfolioScoreRequest) -> List[PortfolioScoreItem]:
+    if not req.auto:
+        raise HTTPException(400, "Endpoint score wspiera jedynie tryb auto")
+
+    ch = get_ch()
+    candidates = _list_candidate_symbols(ch, req.auto.filters)
+    if not candidates:
+        raise HTTPException(404, "Brak symboli do oceny")
+
+    ranked = _rank_symbols_by_score(ch, candidates, req.auto.components)
+    if not ranked:
+        raise HTTPException(404, "Brak symboli ze wszystkimi wymaganymi danymi")
+
+    top = ranked[: req.auto.top_n]
+    return [
+        PortfolioScoreItem(symbol=pretty_symbol(sym), raw=sym, score=score)
+        for sym, score in top
+    ]
+
+
 def _parse_backtest_get(
     mode: str = Query(
         default="manual",
@@ -993,6 +1023,13 @@ def backtest_portfolio(req: BacktestPortfolioRequest):
     """
 
     return _run_backtest(req)
+
+
+@app.post("/backtest/portfolio/score", response_model=List[PortfolioScoreItem])
+def backtest_portfolio_score(req: PortfolioScoreRequest):
+    """Zwraca ranking spółek na podstawie konfiguracji trybu auto."""
+
+    return _compute_portfolio_score(req)
 
 
 @app.get("/backtest/portfolio/tooling", response_model=BacktestPortfolioTooling)

@@ -8,6 +8,7 @@ Poniższy przewodnik opisuje, jak frontend może poprawnie wywoływać endpoint 
 | --- | --- | --- |
 | `/backtest/portfolio` | `POST` | Właściwy backtest na podstawie payloadu JSON (manual lub auto). |
 | `/backtest/portfolio` | `GET` | Wariant pomocniczy (query string), użyteczny do szybkich testów i debugowania. |
+| `/backtest/portfolio/score` | `POST` | Ranking spółek dla konfiguracji trybu auto (top_n, komponenty, filtry). |
 | `/backtest/portfolio/tooling` | `GET` | Metadane do budowy formularzy – podpowiada dostępne opcje, zakresy i opisy pól. |
 | `/symbols` | `GET` | Lista dostępnych tickerów (np. do autocomplete). |
 
@@ -122,7 +123,8 @@ Endpoint zwraca obiekt [`PortfolioResp`](../api/main.py) zawierający:
 1. **Pobieranie metadanych** – odczytaj `/backtest/portfolio/tooling`, aby zasilić kontrolki formularza domyślnymi zakresami i opisami.
 2. **Walidacja symboli** – użyj `/symbols?q=...` do autosugestii. Backend i tak normalizuje wejścia (`CDR.WA` → `CDPROJEKT`).
 3. **Budowa payloadu** – w zależności od trybu, front wysyła `manual` albo `auto`. Wysyłanie obu naraz zakończy się błędem 422.
-4. **Obsługa błędów** – backend zwraca kody 400/404/422 z komunikatami (np. brak danych historycznych). Pokazuj je użytkownikowi.
-5. **Prezentacja wyników** – wykres equity można budować bezpośrednio na tablicy `equity`. Statystyki pokazuj obok, wszystkie są wyliczone z kursów zamknięcia.
+4. **Podgląd rankingu** – jeżeli potrzebujesz tylko listy najlepszych spółek według konfiguracji auto, wyślij ten sam obiekt `auto` do `/backtest/portfolio/score`. Odpowiedź zawiera pola `symbol` (np. `CDR.WA`), `raw` (`CDPROJEKT`) i `score`.
+5. **Obsługa błędów** – backend zwraca kody 400/404/422 z komunikatami (np. brak danych historycznych). Pokazuj je użytkownikowi.
+6. **Prezentacja wyników** – wykres equity można budować bezpośrednio na tablicy `equity`. Statystyki pokazuj obok, wszystkie są wyliczone z kursów zamknięcia.
 
 Dzięki powyższym krokom frontend może w spójny sposób uruchamiać backtest portfela oparty na kursach zamknięcia i prezentować jego rezultaty.

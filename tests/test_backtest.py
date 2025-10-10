@@ -120,3 +120,44 @@ def test_backtest_portfolio_auto_handles_missing_history(monkeypatch):
 
     assert result.stats.last_value == pytest.approx(1.3, rel=1e-5)
     assert len(result.equity) == len(data["AAA"])
+
+
+def test_portfolio_score_returns_top_n(monkeypatch):
+    data = {
+        "AAA": [
+            ("2023-01-01", 100.0),
+            ("2023-01-02", 105.0),
+            ("2023-01-03", 110.0),
+            ("2023-01-04", 115.0),
+        ],
+        "BBB": [
+            ("2023-01-01", 50.0),
+            ("2023-01-02", 51.0),
+            ("2023-01-03", 52.0),
+            ("2023-01-04", 53.0),
+        ],
+        "CCC": [
+            ("2023-01-01", 40.0),
+            ("2023-01-02", 60.0),
+            ("2023-01-03", 80.0),
+            ("2023-01-04", 120.0),
+        ],
+    }
+
+    fake = FakeClickHouse(data)
+    monkeypatch.setattr(main, "get_ch", lambda: fake)
+
+    request = main.PortfolioScoreRequest(
+        auto=main.AutoSelectionConfig(
+            top_n=2,
+            components=[
+                main.ScoreComponent(lookback_days=2, metric="total_return", weight=5)
+            ],
+            weighting="equal",
+        )
+    )
+
+    result = main.backtest_portfolio_score(request)
+
+    assert [item.raw for item in result] == ["CCC", "AAA"]
+    assert all(item.symbol.endswith(".WA") or item.symbol == item.raw for item in result)

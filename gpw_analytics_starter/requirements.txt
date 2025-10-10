@@ -1,6 +1,0 @@
-fastapi
-uvicorn
-clickhouse-connect
-psycopg[binary]
-pandas
-yfinance

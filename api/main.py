@@ -192,7 +192,11 @@ app = FastAPI(title="GPW Analytics API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ALLOW_ORIGINS,
+    allow_origins=[
+        "https://gpw-frontend.vercel.app",
+        "http://localhost:3000",
+        "*",  # opcjonalnie na czas testów
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

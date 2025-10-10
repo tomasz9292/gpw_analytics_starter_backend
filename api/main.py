@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -9,9 +10,9 @@ from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 import clickhouse_connect
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 # =========================
 # Konfiguracja / połączenie
@@ -770,46 +771,7 @@ def _compute_backtest(
     return equity, stats
 
 
-@app.post("/backtest/portfolio", response_model=PortfolioResp)
-def backtest_portfolio(req: BacktestPortfolioRequest):
-    """Backtest portfela na bazie kursów zamknięcia.
-
-    Parametry przekazujemy jako JSON z jednym z dwóch trybów:
-
-    - ``manual`` – lista symboli (np. ``["CDR.WA", "PKN.WA"]``) oraz opcjonalne
-      wagi ``weights`` (float). Brak wag oznacza równy podział.
-    - ``auto`` – konfiguracja automatycznego wyboru zawierająca ``top_n`` (liczba
-      spółek), ``components`` (lista słowników z polami ``lookback_days``,
-      ``metric`` i ``weight``) oraz opcjonalne ``filters`` wszechświata symboli.
-
-    Pola ``start`` (``YYYY-MM-DD``) i ``rebalance`` (``none`` | ``monthly`` |
-    ``quarterly`` | ``yearly``) obowiązują w obu trybach.
-
-    Przykładowy request (tryb ``auto``) – identyczny jak w testach
-    integracyjnych – znajduje się w ``examples/backtest_portfolio_auto_request.json``:
-
-    .. code-block:: json
-
-        {
-          "start": "2023-01-01",
-          "rebalance": "none",
-          "auto": {
-            "top_n": 2,
-            "weighting": "equal",
-            "components": [
-              {
-                "lookback_days": 4,
-                "metric": "total_return",
-                "weight": 5
-              }
-            ],
-            "filters": {
-              "include": ["AAA", "DDD"]
-            }
-          }
-        }
-    """
-
+def _run_backtest(req: BacktestPortfolioRequest) -> PortfolioResp:
     dt_start = req.start
     ch = get_ch()
 
@@ -853,6 +815,166 @@ def backtest_portfolio(req: BacktestPortfolioRequest):
 
     equity, stats = _compute_backtest(closes_map, weights_list, dt_start, req.rebalance)
     return PortfolioResp(equity=equity, stats=stats)
+
+
+def _parse_backtest_get(
+    mode: str = Query(
+        default="manual",
+        description="Wybierz tryb budowy portfela: manual lub auto.",
+    ),
+    start: str = Query(
+        default=date(2015, 1, 1).isoformat(),
+        description="Początek backtestu w formacie YYYY-MM-DD.",
+    ),
+    rebalance: str = Query(
+        default="monthly",
+        description="Częstotliwość rebalancingu (none, monthly, quarterly, yearly).",
+    ),
+    symbols: Optional[List[str]] = Query(
+        default=None,
+        description="Lista symboli GPW (powtarzalny parametr) dla trybu manual.",
+    ),
+    weights: Optional[List[float]] = Query(
+        default=None,
+        description="Lista wag odpowiadająca kolejności symboli (powtarzalny parametr).",
+    ),
+    top_n: Optional[int] = Query(
+        default=None,
+        description="Liczba spółek do wyboru w trybie auto.",
+    ),
+    weighting: str = Query(
+        default="equal",
+        description="Strategia wag w trybie auto: equal lub score.",
+    ),
+    components: Optional[List[str]] = Query(
+        default=None,
+        description=(
+            "Lista komponentów score'u. Każdy element może być JSON-em lub zapisem "
+            "lookback:metric:weight (np. 252:total_return:5)."
+        ),
+    ),
+    filters_include: Optional[List[str]] = Query(
+        default=None,
+        description="Filtr: bierz pod uwagę tylko wskazane symbole.",
+    ),
+    filters_exclude: Optional[List[str]] = Query(
+        default=None,
+        description="Filtr: pomiń wskazane symbole.",
+    ),
+    filters_prefixes: Optional[List[str]] = Query(
+        default=None,
+        description="Filtr: ogranicz do symboli zaczynających się od prefiksów.",
+    ),
+) -> BacktestPortfolioRequest:
+    try:
+        start_dt = date.fromisoformat(start)
+    except ValueError as exc:  # pragma: no cover - defensywne
+        raise HTTPException(400, "Parametr start musi być w formacie YYYY-MM-DD") from exc
+
+    payload: Dict[str, object] = {"start": start_dt, "rebalance": rebalance}
+
+    mode_normalized = mode.strip().lower()
+    if mode_normalized == "manual":
+        if not symbols:
+            raise HTTPException(400, "Tryb manual wymaga co najmniej jednego symbolu")
+        manual_payload: Dict[str, object] = {"symbols": list(symbols)}
+        if weights:
+            manual_payload["weights"] = list(weights)
+        payload["manual"] = manual_payload
+    elif mode_normalized == "auto":
+        if top_n is None:
+            raise HTTPException(400, "Tryb auto wymaga parametru top_n")
+        if not components:
+            raise HTTPException(400, "Tryb auto wymaga przynajmniej jednego komponentu")
+
+        parsed_components: List[Dict[str, object]] = []
+        for raw in components:
+            raw_value = raw.strip()
+            if not raw_value:
+                continue
+            comp_data: Dict[str, object]
+            try:
+                loaded = json.loads(raw_value)
+            except json.JSONDecodeError:
+                parts = raw_value.split(":")
+                if len(parts) != 3:
+                    raise HTTPException(
+                        400,
+                        "Komponent musi być JSON-em lub mieć format lookback:metric:weight",
+                    )
+                lookback_str, metric, weight_str = parts
+                try:
+                    lookback_days = int(lookback_str)
+                    weight_val = int(weight_str)
+                except ValueError as exc:
+                    raise HTTPException(
+                        400, "Lookback i weight muszą być liczbami całkowitymi"
+                    ) from exc
+                comp_data = {
+                    "lookback_days": lookback_days,
+                    "metric": metric,
+                    "weight": weight_val,
+                }
+            else:
+                if not isinstance(loaded, dict):
+                    raise HTTPException(400, "JSON komponentu musi być obiektem")
+                comp_data = loaded
+            parsed_components.append(comp_data)
+
+        if not parsed_components:
+            raise HTTPException(400, "Lista komponentów nie może być pusta")
+
+        auto_payload: Dict[str, object] = {
+            "top_n": top_n,
+            "weighting": weighting,
+            "components": parsed_components,
+        }
+
+        if filters_include or filters_exclude or filters_prefixes:
+            filters_payload: Dict[str, List[str]] = {}
+            if filters_include:
+                filters_payload["include"] = list(filters_include)
+            if filters_exclude:
+                filters_payload["exclude"] = list(filters_exclude)
+            if filters_prefixes:
+                filters_payload["prefixes"] = list(filters_prefixes)
+            auto_payload["filters"] = filters_payload
+
+        payload["auto"] = auto_payload
+    else:
+        raise HTTPException(400, "Parametr mode musi przyjmować wartości manual lub auto")
+
+    try:
+        return BacktestPortfolioRequest.model_validate(payload)
+    except ValidationError as exc:
+        raise HTTPException(422, exc.errors()) from exc
+
+
+@app.get("/backtest/portfolio", response_model=PortfolioResp)
+def backtest_portfolio_get(req: BacktestPortfolioRequest = Depends(_parse_backtest_get)):
+    """GET-owy wariant backtestu portfela.
+
+    Umożliwia szybkie testy z poziomu przeglądarki, np.:
+
+    ``/backtest/portfolio?mode=manual&symbols=CDR.WA&symbols=PKN.WA&start=2023-01-01``
+
+    ``/backtest/portfolio?mode=auto&top_n=3&components=252:total_return:5``
+    """
+
+    return _run_backtest(req)
+
+
+@app.post("/backtest/portfolio", response_model=PortfolioResp)
+def backtest_portfolio(req: BacktestPortfolioRequest):
+    """Backtest portfela na bazie kursów zamknięcia.
+
+    Endpoint obsługuje zarówno klasyczny POST (JSON), jak i wariant GET opisany
+    w dokumentacji wyżej. Tryb ``manual`` przyjmuje listę symboli oraz opcjonalne
+    wagi, a tryb ``auto`` – konfigurację komponentów score'u wraz z filtrami
+    wszechświata i sposobem ważenia (``equal`` lub ``score``).
+    """
+
+    return _run_backtest(req)
 
 
 @app.get("/backtest/portfolio/tooling", response_model=BacktestPortfolioTooling)
